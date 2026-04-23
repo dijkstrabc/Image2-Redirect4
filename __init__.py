@@ -7,9 +7,6 @@ import urllib.error
 import json
 import base64
 
-# ==========================================
-# 节点逻辑实现类
-# ==========================================
 class GPTImageCreateNode:
     def __init__(self):
         pass
@@ -18,20 +15,14 @@ class GPTImageCreateNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # 1. 基础接口配置
                 "api_key": ("STRING", {"default": "sk-12345678"}),
                 "endpoint": ("STRING", {"default": "http://3.34.136.247:8080/v1/images/generations"}),
                 "model": ("STRING", {"default": "gpt-image-2"}),
-                
-                # 2. 尺寸控制：遵循文档 Flexible sizes 特性，支持 8 像素步长调节
                 "width": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8}),
                 "height": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 8}),
+                "partial_images": ("INT", {"default": 2, "min": 0, "max": 5}),
                 
-                # 3. 官方文档参数：质量与风格
-                "quality": (["standard", "hd"], {"default": "standard"}),
-                "style": (["vivid", "natural"], {"default": "vivid"}),
-                
-                # 4. 连线输入：强制文本输入点放在最后，彻底防止 ComfyUI 参数位移 Bug
+                # 依然放在最后，防止参数位移 Bug
                 "prompt": ("STRING", {"forceInput": True}),
             }
         }
@@ -41,88 +32,91 @@ class GPTImageCreateNode:
     FUNCTION = "generate"
     CATEGORY = "Custom API/GPT"
 
-    def generate(self, api_key, endpoint, model, width, height, quality, style, prompt):
+    def generate(self, api_key, endpoint, model, width, height, partial_images, prompt):
         if not api_key:
-            raise ValueError("错误：API Key 不能为空")
-        
-        if not prompt or str(prompt).strip() == "":
-            raise ValueError("错误：输入的 Prompt 不能为空")
+            raise ValueError("API Key 不能为空")
 
-        # 根据 OpenAI 官方文档构造 Payload
-        # size 格式必须为 '1024x1024' (小写x连接)
+        # 严格按照你的 curl 成功的参数构造 Payload
         payload = {
             "model": model,
             "prompt": str(prompt),
-            "n": 1,
             "size": f"{width}x{height}",
-            "quality": quality,
-            "style": style,
-            "response_format": "b64_json" # 优先使用 base64 传输，稳定性最高
+            "stream": True,
+            "partial_images": partial_images,
+            "response_format": "b64_json"
         }
 
         headers = {
-            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "ComfyUI-GPT-Image-v2"
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream", # 明确告知服务器我们要接收流
+            "User-Agent": "ComfyUI-GPT-Client/1.0"
         }
 
-        # 转换数据并准备请求
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(endpoint, headers=headers, data=data)
+        # 准备 POST 请求
+        req = urllib.request.Request(
+            endpoint, 
+            data=json.dumps(payload).encode('utf-8'), 
+            headers=headers,
+            method='POST'
+        )
         
+        last_b64_data = None
+
         try:
-            # 图像生成可能耗时，设置 120 秒超时
+            # 发起请求
             with urllib.request.urlopen(req, timeout=120) as response:
-                result = json.loads(response.read().decode('utf-8'))
+                # 核心：逐行读取流数据 (SSE 协议)
+                for line in response:
+                    line_str = line.decode('utf-8').strip()
+                    
+                    # 只有以 data: 开头的行才是有效数据
+                    if not line_str.startswith("data: "):
+                        continue
+                    
+                    # 提取数据内容
+                    raw_data = line_str[6:]
+                    if raw_data == "[DONE]":
+                        break
+                    
+                    try:
+                        event = json.loads(raw_data)
+                        
+                        # 情况 A: 官方示例中的中间预览图格式 (partial_image)
+                        if "b64_json" in event:
+                            last_b64_data = event["b64_json"]
+                        
+                        # 情况 B: 标准 OpenAI 最终图格式 (data[0].b64_json)
+                        elif "data" in event and isinstance(event["data"], list) and len(event["data"]) > 0:
+                            if "b64_json" in event["data"][0]:
+                                last_b64_data = event["data"][0]["b64_json"]
+                                
+                    except json.JSONDecodeError:
+                        continue
+
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode('utf-8')
-            raise RuntimeError(f"API请求报错 HTTP {e.code}: {err_body}")
+            err_msg = e.read().decode('utf-8')
+            raise RuntimeError(f"API 请求失败 {e.code}: {err_msg}")
         except Exception as e:
-            raise RuntimeError(f"网络连接失败: {str(e)}")
+            raise RuntimeError(f"网络连接异常: {str(e)}")
 
-        # 处理 API 返回的业务错误
-        if "error" in result:
-            err_msg = result["error"].get("message", "未知 API 错误")
-            raise RuntimeError(f"模型接口报错: {err_msg}")
+        if not last_b64_data:
+            raise RuntimeError("流式传输结束，但未能在响应中捕获到任何有效的图像数据 (b64_json)")
 
-        # 解析并加载图像数据
+        # 将最终抓取到的 Base64 数据转为 Tensor
         try:
-            image_item = result["data"][0]
-            
-            # 方案 A: 解析 Base64
-            if "b64_json" in image_item:
-                img_bytes = base64.b64decode(image_item["b64_json"])
-            # 方案 B: 如果接口强行返回 URL
-            elif "url" in image_item:
-                img_url = image_item["url"]
-                req_img = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req_img, timeout=60) as response:
-                    img_bytes = response.read()
-            else:
-                raise ValueError("API 返回数据中缺少图像内容 (b64_json/url)")
-            
-            # 将二进制流转为 PIL Image 再转为 ComfyUI Tensor
+            img_bytes = base64.b64decode(last_b64_data)
             pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             
-            # 转换：(H, W, C) -> (0-1 float) -> (1, H, W, C)
+            # 转换为 (Batch, H, W, C) 的 Tensor 格式
             img_np = np.array(pil_img).astype(np.float32) / 255.0
             img_tensor = torch.from_numpy(img_np).unsqueeze(0)
             
             return (img_tensor,)
-            
         except Exception as e:
-            raise RuntimeError(f"图像数据转换 Tensor 失败: {str(e)}")
+            raise RuntimeError(f"图像数据处理失败: {str(e)}")
 
-
-# ==========================================
-# ComfyUI 节点注册
-# ==========================================
-NODE_CLASS_MAPPINGS = {
-    "GPTImageCreateNode": GPTImageCreateNode
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "GPTImageCreateNode": "GPT Image Create (OpenAI API)"
-}
-
+# 节点注册
+NODE_CLASS_MAPPINGS = {"GPTImageCreateNode": GPTImageCreateNode}
+NODE_DISPLAY_NAME_MAPPINGS = {"GPTImageCreateNode": "GPT Image Create (Official Stream)"}
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
